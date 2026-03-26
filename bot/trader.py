@@ -1,21 +1,21 @@
 import logging
-import os
 import time
 
-import pandas as pd
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs
 
 from bot.risk_manager import RiskManager
-from strategies.base import BaseStrategy, OrderRequest
+from strategies.base import BaseStrategy, MarketContext, OrderBookSnapshot, OrderRequest
 
 logger = logging.getLogger(__name__)
 
 
 class Trader:
     """
-    Core trading loop. Fetches market data, runs strategy signals,
+    Core trading loop. Fetches order books, runs strategy logic,
     and submits limit orders through the Polymarket CLOB API.
+
+    Supports multi-token strategies (e.g. YES/NO arbitrage).
     """
 
     def __init__(
@@ -23,35 +23,47 @@ class Trader:
         client: ClobClient,
         strategy: BaseStrategy,
         risk_manager: RiskManager,
-        token_id: str,
-        order_size: float = 10.0,
-        poll_interval: int = 30,
+        token_ids: list[str],
+        poll_interval: float = 5.0,
     ):
         self.client = client
         self.strategy = strategy
         self.risk_manager = risk_manager
-        self.token_id = token_id
-        self.order_size = order_size
+        self.token_ids = token_ids
         self.poll_interval = poll_interval
         self.running = False
-        self.price_history: list[dict] = []
+        self.inventory: dict[str, float] = {tid: 0.0 for tid in token_ids}
+        self.open_order_ids: list[str] = []
 
-    def _fetch_current_price(self) -> float | None:
-        """Fetch the current mid-market price from the order book."""
+    def _fetch_order_book(self, token_id: str) -> OrderBookSnapshot | None:
         try:
-            book = self.client.get_order_book(self.token_id)
-            best_bid = float(book.bids[0].price) if book.bids else 0.0
-            best_ask = float(book.asks[0].price) if book.asks else 1.0
-            return (best_bid + best_ask) / 2
+            book = self.client.get_order_book(token_id)
+            bids = [(float(b.price), float(b.size)) for b in book.bids]
+            asks = [(float(a.price), float(a.size)) for a in book.asks]
+            return OrderBookSnapshot(token_id=token_id, bids=bids, asks=asks)
         except Exception:
-            logger.exception("Failed to fetch order book")
+            logger.exception("Failed to fetch order book for %s", token_id)
             return None
 
-    def _build_price_dataframe(self) -> pd.DataFrame:
-        return pd.DataFrame(self.price_history)
+    def _fetch_all_books(self) -> dict[str, OrderBookSnapshot] | None:
+        books = {}
+        for tid in self.token_ids:
+            snap = self._fetch_order_book(tid)
+            if snap is None:
+                return None
+            books[tid] = snap
+        return books
+
+    def _cancel_stale_orders(self) -> None:
+        for order_id in self.open_order_ids:
+            try:
+                self.client.cancel(order_id)
+                logger.debug("Cancelled stale order %s", order_id)
+            except Exception:
+                logger.debug("Could not cancel order %s (may already be filled)", order_id)
+        self.open_order_ids.clear()
 
     def _submit_limit_order(self, order: OrderRequest) -> str | None:
-        """Submit a limit order via the CLOB client. Returns order ID or None."""
         try:
             order_args = OrderArgs(
                 token_id=order.token_id,
@@ -75,59 +87,44 @@ class Trader:
             logger.exception("Failed to submit order")
             return None
 
-    def _cancel_open_orders(self) -> None:
-        """Cancel all open orders for the tracked token."""
-        try:
-            open_orders = self.client.get_orders(
-                params={"asset_id": self.token_id, "state": "live"}
-            )
-            for order in open_orders:
-                self.client.cancel(order["id"])
-                logger.info("Cancelled order %s", order["id"])
-        except Exception:
-            logger.exception("Failed to cancel open orders")
-
     def tick(self) -> None:
         """Execute one iteration of the trading loop."""
-        price = self._fetch_current_price()
-        if price is None:
+        # Cancel previous cycle's orders before requoting
+        self._cancel_stale_orders()
+
+        books = self._fetch_all_books()
+        if books is None:
             return
 
-        self.price_history.append(
-            {
-                "price": price,
-                "timestamp": pd.Timestamp.now(),
-                "buy_volume": 0.0,
-                "sell_volume": 0.0,
-            }
+        ctx = MarketContext(
+            token_ids=self.token_ids,
+            order_books=books,
+            inventory=dict(self.inventory),
         )
 
-        df = self._build_price_dataframe()
-        signal = self.strategy.generate_signal(df)
-        order = self.strategy.create_order(
-            self.token_id, signal, price, self.order_size, df
-        )
-
-        if order is None:
-            logger.debug("Signal: HOLD — no order")
+        orders = self.strategy.generate_orders(ctx)
+        if not orders:
+            logger.debug("No orders from %s", self.strategy.name)
             return
 
-        approved, reason = self.risk_manager.check_order(order)
-        if not approved:
-            logger.warning("Order rejected by risk manager: %s", reason)
-            return
+        for order in orders:
+            approved, reason = self.risk_manager.check_order(order)
+            if not approved:
+                logger.warning("Order rejected: %s", reason)
+                continue
 
-        order_id = self._submit_limit_order(order)
-        if order_id:
-            self.risk_manager.record_order_placed()
+            order_id = self._submit_limit_order(order)
+            if order_id:
+                self.open_order_ids.append(order_id)
+                self.risk_manager.record_order_placed()
 
     def run(self) -> None:
         """Start the main polling loop."""
         self.running = True
         logger.info(
-            "Trader started: strategy=%s token=%s interval=%ds",
+            "Trader started: strategy=%s tokens=%s interval=%.1fs",
             self.strategy.name,
-            self.token_id,
+            self.token_ids,
             self.poll_interval,
         )
         while self.running:
@@ -142,5 +139,5 @@ class Trader:
 
     def stop(self) -> None:
         self.running = False
-        self._cancel_open_orders()
+        self._cancel_stale_orders()
         logger.info("Trader stopped")

@@ -2,24 +2,27 @@
 
 Automated limit-order trading bot for [Polymarket](https://polymarket.com) prediction markets, powered by the [py-clob-client](https://github.com/Polymarket/py-clob-client) SDK.
 
+Three strategies targeting real edges in prediction markets — no technical analysis indicators.
+
 ## Project Structure
 
 ```
-├── strategies/          # Trading strategy implementations
-│   ├── base.py          # Abstract base strategy + Signal/OrderRequest types
-│   ├── macd_strategy.py # MACD crossover strategy
-│   ├── rsi_strategy.py  # RSI mean-reversion strategy
-│   └── cvd_strategy.py  # Cumulative Volume Delta divergence strategy
-├── backtesting/         # Backtesting framework
-│   └── engine.py        # Backtest engine with fill simulation
-├── bot/                 # Live trading components
-│   ├── trader.py        # Main trading loop + CLOB order submission
-│   └── risk_manager.py  # Position limits, daily loss caps, order gating
-├── deploy/              # Entry points
-│   ├── run_live.py      # Live trading entry point
-│   └── run_backtest.py  # Backtesting entry point
-├── .env.example         # Environment variable template
-├── requirements.txt     # Python dependencies
+├── strategies/                  # Trading strategies
+│   ├── base.py                  # Base types: OrderBookSnapshot, MarketContext, OrderRequest
+│   ├── arb_strategy.py          # Yes/No arbitrage (risk-free spread capture)
+│   ├── market_maker_strategy.py # Two-sided quoting with inventory skew
+│   └── scanner_strategy.py      # Bond strategy + longshot fading
+├── backtesting/                 # Backtesting framework
+│   └── engine.py                # Backtest engine with limit order fill simulation
+├── bot/                         # Live trading components
+│   ├── trader.py                # Multi-token trading loop with order management
+│   └── risk_manager.py          # Position limits, daily loss caps, order gating
+├── deploy/                      # Entry points
+│   ├── run_live.py              # Live trading (arb, mm, scanner)
+│   ├── run_scanner.py           # Multi-market scanner with dry-run mode
+│   └── run_backtest.py          # Backtesting entry point
+├── .env.example                 # Environment variable template
+├── requirements.txt             # Python dependencies
 └── .gitignore
 ```
 
@@ -35,42 +38,78 @@ cp .env.example .env
 
 ## Strategies
 
-| Strategy | Signal Logic | Best For |
-|----------|-------------|----------|
-| **MACD** | Buy on MACD/signal bullish crossover, sell on bearish crossover | Trending markets |
-| **RSI** | Buy when RSI < 30 (oversold), sell when RSI > 70 (overbought) | Mean-reverting markets |
-| **CVD** | Buy on bullish volume/price divergence, sell on bearish divergence | Volume-driven markets |
+### 1. Yes/No Arbitrage (`arb`)
 
-All strategies place **limit orders only** — no market orders are ever used.
+**Edge**: YES + NO tokens must sum to $1.00. When `best_ask(YES) + best_ask(NO) < $1.00`, buy both sides for risk-free profit.
 
-## Usage
-
-### Live Trading
+- Documented profit: 1.5-3% per trade
+- $40M in arb profits extracted from Polymarket in 2024-2025
+- Zero directional risk when both legs fill
 
 ```bash
-python -m deploy.run_live --token-id <TOKEN_ID> --strategy macd --order-size 10
+python -m deploy.run_live --strategy arb \
+  --yes-token <YES_TOKEN_ID> \
+  --no-token <NO_TOKEN_ID> \
+  --order-size 20 \
+  --poll-interval 2
 ```
 
-### Backtesting
+### 2. Market Maker (`mm`)
 
-Prepare a CSV file with columns `timestamp` and `price` (plus `buy_volume` and `sell_volume` for the CVD strategy):
+**Edge**: Post two-sided limit orders to capture bid-ask spread plus Polymarket liquidity rewards.
+
+- Inventory skew: automatically adjusts quotes to stay flat
+- Best for markets with $50K+ daily volume and 30+ day duration
+- Returns scale with capital
 
 ```bash
-python -m deploy.run_backtest --strategy rsi --data historical_prices.csv --balance 1000
+python -m deploy.run_live --strategy mm \
+  --token-id <TOKEN_ID> \
+  --order-size 10 \
+  --poll-interval 5
+```
+
+### 3. Market Scanner (`scanner`)
+
+**Edge**: Exploits systematic mispricings — near-certain outcomes (>92c) are underpriced, longshots (<8c) are overpriced by fan bias.
+
+- "Bond strategy": buy near-certain outcomes at a discount, collect $1 at resolution
+- Expected return: 3-8% per position
+- Supports dry-run mode for testing
+
+```bash
+# Scan all markets (dry-run first):
+python -m deploy.run_scanner --dry-run --min-price 0.92 --max-price 0.97
+
+# Live scanning:
+python -m deploy.run_scanner --order-size 15 --scan-interval 300
+
+# Single-token scanner:
+python -m deploy.run_live --strategy scanner --token-id <TOKEN_ID>
 ```
 
 ## Risk Management
 
-The risk manager enforces:
-- **Max position size** — caps notional exposure per token
-- **Daily loss limit** — halts trading if cumulative daily loss exceeds threshold
-- **Open order limit** — prevents excessive concurrent orders
-- **Price bounds** — ensures limit prices stay within Polymarket's [0.01, 0.99] range
+| Limit | Default | Description |
+|-------|---------|-------------|
+| Max position size | $100 | Caps notional exposure per token |
+| Daily loss limit | $50 | Halts all trading if exceeded |
+| Open order limit | 20 | Prevents excessive concurrent orders |
+| Price bounds | [0.01, 0.99] | Enforces Polymarket valid range |
 
-Configure limits via environment variables in `.env`.
+Configure via `.env`.
+
+## Architecture
+
+All strategies implement `BaseStrategy.generate_orders(ctx: MarketContext) -> list[OrderRequest]`:
+
+- **MarketContext** provides order books, token IDs, and current inventory
+- Strategies return zero or more `OrderRequest` objects (limit orders only)
+- The `Trader` loop handles order submission, cancellation, and requoting
+- The `RiskManager` gates every order before submission
 
 ## Adding a New Strategy
 
-1. Create a new file in `strategies/`
-2. Subclass `BaseStrategy` and implement `generate_signal()` and `get_limit_price()`
-3. Register the strategy in `deploy/run_live.py` and `deploy/run_backtest.py`
+1. Create `strategies/my_strategy.py`, subclass `BaseStrategy`
+2. Implement `generate_orders(ctx) -> list[OrderRequest]`
+3. Register in `deploy/run_live.py`

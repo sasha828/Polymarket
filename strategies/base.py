@@ -1,14 +1,30 @@
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from enum import Enum
-
-import pandas as pd
+from dataclasses import dataclass, field
 
 
-class Signal(Enum):
-    BUY = "buy"
-    SELL = "sell"
-    HOLD = "hold"
+@dataclass
+class OrderBookSnapshot:
+    """Snapshot of one side of an order book."""
+
+    token_id: str
+    bids: list[tuple[float, float]] = field(default_factory=list)  # (price, size)
+    asks: list[tuple[float, float]] = field(default_factory=list)  # (price, size)
+
+    @property
+    def best_bid(self) -> float:
+        return self.bids[0][0] if self.bids else 0.0
+
+    @property
+    def best_ask(self) -> float:
+        return self.asks[0][0] if self.asks else 1.0
+
+    @property
+    def midpoint(self) -> float:
+        return (self.best_bid + self.best_ask) / 2
+
+    @property
+    def spread(self) -> float:
+        return self.best_ask - self.best_bid
 
 
 @dataclass
@@ -20,6 +36,15 @@ class OrderRequest:
     reason: str
 
 
+@dataclass
+class MarketContext:
+    """All data a strategy needs to make decisions."""
+
+    token_ids: list[str]
+    order_books: dict[str, OrderBookSnapshot]  # token_id -> snapshot
+    inventory: dict[str, float]  # token_id -> net shares held
+
+
 class BaseStrategy(ABC):
     """Base class for all trading strategies."""
 
@@ -27,32 +52,5 @@ class BaseStrategy(ABC):
         self.name = name
 
     @abstractmethod
-    def generate_signal(self, price_history: pd.DataFrame) -> Signal:
-        """Analyze price history and return a trading signal."""
-
-    @abstractmethod
-    def get_limit_price(
-        self, signal: Signal, current_price: float, price_history: pd.DataFrame
-    ) -> float:
-        """Compute the limit order price for a given signal."""
-
-    def create_order(
-        self,
-        token_id: str,
-        signal: Signal,
-        current_price: float,
-        size: float,
-        price_history: pd.DataFrame,
-    ) -> OrderRequest | None:
-        if signal == Signal.HOLD:
-            return None
-
-        price = self.get_limit_price(signal, current_price, price_history)
-        side = "BUY" if signal == Signal.BUY else "SELL"
-        return OrderRequest(
-            token_id=token_id,
-            side=side,
-            price=round(price, 2),
-            size=size,
-            reason=f"{self.name}:{signal.value}",
-        )
+    def generate_orders(self, ctx: MarketContext) -> list[OrderRequest]:
+        """Analyze market context and return zero or more limit orders."""

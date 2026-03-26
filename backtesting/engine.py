@@ -3,7 +3,7 @@ from dataclasses import dataclass, field
 
 import pandas as pd
 
-from strategies.base import BaseStrategy, Signal
+from strategies.base import BaseStrategy, MarketContext, OrderBookSnapshot
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +42,6 @@ class BacktestResult:
     def win_rate(self) -> float:
         if not self.trades:
             return 0.0
-        # Pair up buy/sell trades and check profitability
         buys: list[Trade] = []
         wins = 0
         total_pairs = 0
@@ -84,8 +83,10 @@ class BacktestEngine:
     """
     Simulates strategy execution against historical price data.
 
-    Assumes limit orders fill at the requested price when the market
-    price crosses through it on the next bar.
+    Converts each bar's price into a synthetic order book snapshot and
+    passes it through the strategy's generate_orders() interface.
+    Limit orders fill when the market price crosses through them on
+    the next bar.
     """
 
     def __init__(
@@ -100,36 +101,45 @@ class BacktestEngine:
         self.order_size = order_size
         self.fee_rate = fee_rate
 
-    def run(self, price_history: pd.DataFrame) -> BacktestResult:
+    def _price_to_book(self, token_id: str, price: float, spread: float = 0.02) -> OrderBookSnapshot:
+        """Convert a single price into a synthetic order book."""
+        half = spread / 2
+        return OrderBookSnapshot(
+            token_id=token_id,
+            bids=[(round(max(0.01, price - half), 2), 1000.0)],
+            asks=[(round(min(0.99, price + half), 2), 1000.0)],
+        )
+
+    def run(self, price_history: pd.DataFrame, token_id: str = "backtest_token") -> BacktestResult:
         """
         Run the backtest over the provided price history DataFrame.
 
-        Expects at minimum a 'price' column and a DatetimeIndex or
-        'timestamp' column.
+        Expects at minimum a 'price' column and a 'timestamp' column.
         """
         result = BacktestResult(initial_balance=self.initial_balance)
         balance = self.initial_balance
         position = 0.0
-        pending_order = None
+        pending_orders: list[dict] = []
 
         for i in range(1, len(price_history)):
             current_bar = price_history.iloc[i]
             current_price = current_bar["price"]
 
-            # Check if pending limit order fills
-            if pending_order is not None:
+            # Check if pending limit orders fill
+            new_pending = []
+            for order in pending_orders:
                 filled = False
-                if pending_order["side"] == "BUY" and current_price <= pending_order["price"]:
+                if order["side"] == "BUY" and current_price <= order["price"]:
                     filled = True
-                elif pending_order["side"] == "SELL" and current_price >= pending_order["price"]:
+                elif order["side"] == "SELL" and current_price >= order["price"]:
                     filled = True
 
                 if filled:
-                    fill_price = pending_order["price"]
-                    size = pending_order["size"]
+                    fill_price = order["price"]
+                    size = order["size"]
                     fee = fill_price * size * self.fee_rate
 
-                    if pending_order["side"] == "BUY":
+                    if order["side"] == "BUY":
                         balance -= fill_price * size + fee
                         position += size
                     else:
@@ -144,42 +154,42 @@ class BacktestEngine:
                     result.trades.append(
                         Trade(
                             timestamp=ts,
-                            side=pending_order["side"],
+                            side=order["side"],
                             price=fill_price,
                             size=size,
-                            reason=pending_order["reason"],
+                            reason=order["reason"],
                         )
                     )
-                    pending_order = None
+                else:
+                    new_pending.append(order)
+            pending_orders = new_pending
 
-            # Generate new signal from history up to current bar
-            history_slice = price_history.iloc[: i + 1]
-            signal = self.strategy.generate_signal(history_slice)
+            # Build synthetic order book and market context
+            book = self._price_to_book(token_id, current_price)
+            ctx = MarketContext(
+                token_ids=[token_id],
+                order_books={token_id: book},
+                inventory={token_id: position},
+            )
 
-            if signal != Signal.HOLD and pending_order is None:
-                # Only buy if we have balance, only sell if we have position
-                if signal == Signal.BUY and balance >= self.order_size * current_price:
-                    limit_price = self.strategy.get_limit_price(
-                        signal, current_price, history_slice
-                    )
-                    pending_order = {
-                        "side": "BUY",
-                        "price": limit_price,
-                        "size": self.order_size,
-                        "reason": f"{self.strategy.name}:{signal.value}",
-                    }
-                elif signal == Signal.SELL and position >= self.order_size:
-                    limit_price = self.strategy.get_limit_price(
-                        signal, current_price, history_slice
-                    )
-                    pending_order = {
-                        "side": "SELL",
-                        "price": limit_price,
-                        "size": self.order_size,
-                        "reason": f"{self.strategy.name}:{signal.value}",
-                    }
+            # Generate orders from strategy
+            orders = self.strategy.generate_orders(ctx)
+            for order in orders:
+                if order.side == "BUY" and balance >= order.price * order.size:
+                    pending_orders.append({
+                        "side": order.side,
+                        "price": order.price,
+                        "size": order.size,
+                        "reason": order.reason,
+                    })
+                elif order.side == "SELL" and position >= order.size:
+                    pending_orders.append({
+                        "side": order.side,
+                        "price": order.price,
+                        "size": order.size,
+                        "reason": order.reason,
+                    })
 
-            # Mark-to-market equity
             equity = balance + position * current_price
             result.equity_curve.append(equity)
 
